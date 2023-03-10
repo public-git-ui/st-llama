@@ -8,13 +8,12 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.nn.utils import skip_init
 
-import fairscale.nn.model_parallel.initialize as fs_init
-from fairscale.nn.model_parallel.layers import (
-    ParallelEmbedding,
-    RowParallelLinear,
-    ColumnParallelLinear,
-)
+from tqdm import tqdm
+
+# Replace fairscale with nn.Linear
+# https://github.com/venuatu/llama/commit/4000cf8961c5d8c1f3ba26d46cb485ac8279e5a7
 
 
 @dataclass
@@ -27,7 +26,8 @@ class ModelArgs:
     norm_eps: float = 1e-5
 
     max_batch_size: int = 32
-    max_seq_len: int = 2048
+    max_seq_len: int = 1024
+    max_layers_in_gpu:int = 24
 
 
 class RMSNorm(torch.nn.Module):
@@ -77,36 +77,29 @@ class Attention(nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
 
-        self.n_local_heads = args.n_heads // fs_init.get_model_parallel_world_size()
+        self.n_local_heads = args.n_heads  # // fs_init.get_model_parallel_world_size()
         self.head_dim = args.dim // args.n_heads
 
-        self.wq = ColumnParallelLinear(
+        # https://github.com/venuatu/llama/commit/dfdd0ee1f977627888d54832668953f83d9472fc
+        self.wq = skip_init(nn.Linear,
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wk = ColumnParallelLinear(
+        self.wk = skip_init(nn.Linear,
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wv = ColumnParallelLinear(
+        self.wv = skip_init(nn.Linear,
             args.dim,
             args.n_heads * self.head_dim,
             bias=False,
-            gather_output=False,
-            init_method=lambda x: x,
         )
-        self.wo = RowParallelLinear(
+        self.wo = skip_init(nn.Linear,
             args.n_heads * self.head_dim,
             args.dim,
             bias=False,
-            input_is_parallel=True,
-            init_method=lambda x: x,
         )
 
         self.cache_k = torch.zeros(
@@ -161,14 +154,20 @@ class FeedForward(nn.Module):
         hidden_dim = int(2 * hidden_dim / 3)
         hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
 
-        self.w1 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w1 = skip_init(nn.Linear,
+            dim,
+            hidden_dim,
+            bias=False,
         )
-        self.w2 = RowParallelLinear(
-            hidden_dim, dim, bias=False, input_is_parallel=True, init_method=lambda x: x
+        self.w2 = skip_init(nn.Linear,
+            hidden_dim,
+            dim,
+            bias=False,
         )
-        self.w3 = ColumnParallelLinear(
-            dim, hidden_dim, bias=False, gather_output=False, init_method=lambda x: x
+        self.w3 = skip_init(nn.Linear,
+            dim,
+            hidden_dim,
+            bias=False,
         )
 
     def forward(self, x):
@@ -194,6 +193,23 @@ class TransformerBlock(nn.Module):
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
+# https://github.com/gmorenz/llama/commit/4daf7f1a2f2bb22208b5d464bc2a18511d54408d
+def move_parameters_to_gpu(module):
+    if not hasattr(module, "saved"):
+        module.saved = module._parameters.copy()
+    for k, param in module.saved.items():
+        if param is not None:
+            module._parameters[k] = param.to("cuda", non_blocking=True)
+    for child in module.children():
+        move_parameters_to_gpu(child)
+
+def move_parameters_to_cpu(module):
+    for k, param in module.saved.items():
+        del module._parameters[k]
+        module._parameters[k] = param
+    for child in module.children():
+        move_parameters_to_cpu(child)
+
 
 class Transformer(nn.Module):
     def __init__(self, params: ModelArgs):
@@ -202,37 +218,69 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
-        self.tok_embeddings = ParallelEmbedding(
-            params.vocab_size, params.dim, init_method=lambda x: x
+        self.tok_embeddings = skip_init(nn.Embedding,
+            params.vocab_size,
+            params.dim,
         )
 
         self.layers = torch.nn.ModuleList()
         for layer_id in range(params.n_layers):
             self.layers.append(TransformerBlock(layer_id, params))
 
-        self.norm = RMSNorm(params.dim, eps=params.norm_eps)
-        self.output = ColumnParallelLinear(
-            params.dim, params.vocab_size, bias=False, init_method=lambda x: x
-        )
+        self.layer_locations = [None] * len(self.layers)
+
+        self.norm = RMSNorm(params.dim, eps=params.norm_eps).cuda()
+        self.output = skip_init(nn.Linear,
+            params.dim,
+            params.vocab_size,
+            bias=False,
+        ).cuda()
 
         self.freqs_cis = precompute_freqs_cis(
             self.params.dim // self.params.n_heads, self.params.max_seq_len * 2
-        )
+        ).cuda()
+        self.max_layers_in_gpu = params.max_layers_in_gpu
+        self.layer_copied = [False for _ in range(params.n_layers)]
 
     @torch.inference_mode()
     def forward(self, tokens: torch.Tensor, start_pos: int):
+        use_gpu = True  # start_pos == 0
+
         _bsz, seqlen = tokens.shape
         h = self.tok_embeddings(tokens)
-        self.freqs_cis = self.freqs_cis.to(h.device)
+        self.freqs_cis = self.freqs_cis
         freqs_cis = self.freqs_cis[start_pos : start_pos + seqlen]
+        if use_gpu:
+            h = h.cuda()
 
         mask = None
         if seqlen > 1:
-            mask = torch.full((1, 1, seqlen, seqlen), float("-inf"), device=tokens.device)
+            mask = torch.full(
+                (1, 1, seqlen, seqlen), float("-inf"), device=tokens.device
+            )
             mask = torch.triu(mask, diagonal=start_pos + 1).type_as(h)
 
-        for layer in self.layers:
+        if use_gpu and mask is not None:
+            mask = mask.cuda()
+
+        for i, layer in enumerate(self.layers):
+            spillover = i > self.max_layers_in_gpu
+            if not self.layer_copied[i] and use_gpu:
+                try:
+                    move_parameters_to_gpu(layer)
+                    self.layer_copied[i] = True
+                except Exception as e:
+                    print(f'Out of memory at {layer=}, reduce max_layers_in_gpu')
+                    raise e
+
             h = layer(h, start_pos, freqs_cis, mask)
+            if spillover and use_gpu:
+                move_parameters_to_cpu(layer)
+                self.layer_copied[i] = False
+
         h = self.norm(h)
+        if use_gpu:
+            del mask
+            torch.cuda.empty_cache()
         output = self.output(h[:, -1, :])  # only compute last logits
         return output.float()
